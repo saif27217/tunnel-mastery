@@ -52,3 +52,40 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:<LOCAL>/v1/chat/comple
 ```
 
 200 with the tunnel is the failure mode to ignore. 401 through the tunnel means the middleware no longer localhost-whitelists your caller — check remote-side updates.
+
+## 7. Headers arrive, body stalls — Tailscale MTU blackhole
+
+Symptom: `curl` prints the HTTP status line and headers, then hangs until timeout with `exit code 18` or `transfer closed with outstanding read data remaining`.
+
+```bash
+# This hangs mid-body:
+curl -v http://127.0.0.1:<PORT>/api/models
+
+# But this works from the same box:
+curl -v http://<remote-ip>:<PORT>/api/models
+```
+
+And the service responds fine locally on the remote host:
+
+```bash
+curl -s http://127.0.0.1:20128/api/models | wc -c   # full response
+cat /sys/class/net/tailscale0/mtu                  # 1280
+cat /proc/sys/net/ipv4/tcp_mtu_probing             # 0 = off
+```
+
+Root cause: Tailscale’s default 1280-byte MTU. With kernel PMTU probing disabled, oversized TCP segments get silently dropped. The kernel never backs off to smaller segments.
+
+Fix on the remote host:
+
+```bash
+echo 1 | sudo tee /proc/sys/net/ipv4/tcp_mtu_probing
+echo 'net.ipv4.tcp_mtu_probing = 1' | sudo tee /etc/sysctl.d/99-tcp-mtu-probing.conf
+sudo sysctl --system
+```
+
+First request after the change may take 6–10 s while the path MTU is rediscovered; subsequent requests drop to normal speeds.
+
+Do NOT waste time on weaker workarounds first:
+- Lowering `tailscale0 MTU` on one side alone doesn’t help; the other side still sends too-large segments.
+- Switching HTTP versions or disabling chunked encoding doesn’t help; the drop is below HTTP.
+- Running the same transfer over SSH (`ssh user@host 'cat largefile' > local`) hits the same blackhole.
